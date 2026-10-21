@@ -9,9 +9,10 @@ It watches two things:
   `/proc`. A notification is sent when one exits, provided it ran for at least
   60 seconds.
 - **opencode sessions** — top-level [opencode](https://opencode.ai) sessions
-  that have been waiting for input for more than 30 seconds while an opencode
+  that have been waiting for input for more than 60 seconds while an opencode
   instance is still running in the session's directory. If the session's
-  opencode window is focused, no notification is sent.
+  opencode window is focused, no notification is sent. Sending new input
+  cancels the pending notification.
 
 Notifications are delivered through `notify-send`, with the application name
 `wakeup`.

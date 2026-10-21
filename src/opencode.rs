@@ -10,7 +10,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags};
 
-const IDLE_NOTIFY_DELAY: Duration = Duration::from_secs(30);
+const IDLE_NOTIFY_DELAY: Duration = Duration::from_secs(60);
 const OPENCODE_COMMAND: &str = "opencode";
 
 const STATUS_QUERY: &str = r#"
@@ -65,10 +65,14 @@ pub struct ReadySession {
     pub directory: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum State {
     Busy,
-    Idle { since: Instant, notified: bool },
+    Idle {
+        since: Instant,
+        notified: bool,
+        latest_user: Option<String>,
+    },
 }
 
 struct SessionStatus {
@@ -76,6 +80,7 @@ struct SessionStatus {
     title: String,
     directory: String,
     idle: bool,
+    latest_user: Option<String>,
 }
 
 struct OpencodeInstance {
@@ -160,16 +165,28 @@ impl Watcher {
                 None if status.idle => State::Idle {
                     since: now,
                     notified: true,
+                    latest_user: status.latest_user.clone(),
                 },
                 None => State::Busy,
                 Some(State::Busy) if status.idle => State::Idle {
                     since: now,
                     notified: false,
+                    latest_user: status.latest_user.clone(),
                 },
                 Some(State::Busy) => State::Busy,
+                Some(State::Idle { latest_user, .. })
+                    if status.idle && latest_user != &status.latest_user =>
+                {
+                    State::Idle {
+                        since: now,
+                        notified: false,
+                        latest_user: status.latest_user.clone(),
+                    }
+                }
                 Some(State::Idle {
                     since,
                     notified: false,
+                    latest_user,
                 }) if status.idle
                     && now.saturating_duration_since(*since)
                         > IDLE_NOTIFY_DELAY =>
@@ -181,14 +198,18 @@ impl Watcher {
                     State::Idle {
                         since: *since,
                         notified: true,
+                        latest_user: latest_user.clone(),
                     }
                 }
-                Some(State::Idle { since, notified }) if status.idle => {
-                    State::Idle {
-                        since: *since,
-                        notified: *notified,
-                    }
-                }
+                Some(State::Idle {
+                    since,
+                    notified,
+                    latest_user,
+                }) if status.idle => State::Idle {
+                    since: *since,
+                    notified: *notified,
+                    latest_user: latest_user.clone(),
+                },
                 Some(State::Idle { .. }) => State::Busy,
             };
             self.states.insert(status.id, next);
@@ -358,6 +379,7 @@ fn read_statuses(connection: &Connection) -> io::Result<Vec<SessionStatus>> {
                 directory: row.get(1)?,
                 title: row.get(2)?,
                 idle,
+                latest_user: latest_user_id,
             })
         })
         .map_err(io::Error::other)?;
@@ -589,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn notifies_after_waiting_over_thirty_seconds() {
+    fn notifies_after_waiting_over_sixty_seconds() {
         let db = TestDb::new();
         db.session("root", None, "/tmp/project", "Fix the bug");
         db.message("user", "root", 1, user_message());
@@ -616,13 +638,13 @@ mod tests {
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(34), None)
+                .scan_at(start + Duration::from_secs(64), None)
                 .unwrap()
                 .is_empty()
         );
 
         let ready = watcher
-            .scan_at(start + Duration::from_secs(36), None)
+            .scan_at(start + Duration::from_secs(66), None)
             .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
@@ -701,7 +723,7 @@ mod tests {
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(36), None)
+                .scan_at(start + Duration::from_secs(66), None)
                 .unwrap()
                 .is_empty()
         );
@@ -740,7 +762,7 @@ mod tests {
         );
 
         let ready = watcher
-            .scan_at(start + Duration::from_secs(36), None)
+            .scan_at(start + Duration::from_secs(66), None)
             .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
@@ -781,7 +803,7 @@ mod tests {
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(36), Some(5))
+                .scan_at(start + Duration::from_secs(66), Some(5))
                 .unwrap()
                 .is_empty()
         );
@@ -821,7 +843,7 @@ mod tests {
                 .is_empty()
         );
         let ready = watcher
-            .scan_at(start + Duration::from_secs(36), Some(99))
+            .scan_at(start + Duration::from_secs(66), Some(99))
             .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
@@ -862,10 +884,63 @@ mod tests {
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(40), None)
+                .scan_at(start + Duration::from_secs(66), None)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cancels_pending_notification_when_user_input_happened_between_scans() {
+        let db = TestDb::new();
+        db.session("root", None, "/tmp/project", "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher = Watcher::for_test(db.path.clone());
+        let start = Instant::now();
+
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(5), None)
+                .unwrap()
+                .is_empty()
+        );
+
+        db.message("user-2", "root", 4, user_message());
+        db.message(
+            "assistant-2",
+            "root",
+            5,
+            &assistant_message("user-2", Some("stop"), Some(6)),
+        );
+
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(10), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(69), None)
+                .unwrap()
+                .is_empty()
+        );
+        let ready = watcher
+            .scan_at(start + Duration::from_secs(71), None)
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
     }
 
     #[test]
@@ -885,7 +960,7 @@ mod tests {
         assert!(watcher.scan_at(start, None).unwrap().is_empty());
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(31), None)
+                .scan_at(start + Duration::from_secs(61), None)
                 .unwrap()
                 .is_empty()
         );
@@ -913,7 +988,7 @@ mod tests {
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(31), None)
+                .scan_at(start + Duration::from_secs(61), None)
                 .unwrap()
                 .is_empty()
         );
@@ -947,7 +1022,7 @@ mod tests {
         );
         assert_eq!(
             watcher
-                .scan_at(start + Duration::from_secs(36), None)
+                .scan_at(start + Duration::from_secs(66), None)
                 .unwrap()
                 .len(),
             1
