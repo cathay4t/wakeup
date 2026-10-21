@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{io, process::Command, time::Duration};
 
 use crate::{monitor::FinishedTask, opencode::ReadySession};
