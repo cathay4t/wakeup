@@ -6,7 +6,7 @@ use std::{thread, time::Duration};
 
 use monitor::{Monitor, WATCHED_COMMANDS};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 fn main() {
     eprintln!(
