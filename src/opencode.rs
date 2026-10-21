@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, io,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -9,6 +9,7 @@ use std::{
 use rusqlite::{Connection, OpenFlags};
 
 const IDLE_NOTIFY_DELAY: Duration = Duration::from_secs(30);
+const OPENCODE_COMMAND: &str = "opencode";
 
 const STATUS_QUERY: &str = r#"
 SELECT
@@ -77,18 +78,20 @@ struct SessionStatus {
 
 pub struct Watcher {
     db_path: PathBuf,
+    proc_root: Option<PathBuf>,
     connection: Option<Connection>,
     states: HashMap<String, State>,
 }
 
 impl Watcher {
     pub fn new() -> Self {
-        Self::for_database(discover_database())
+        Self::for_database(discover_database(), Some(PathBuf::from("/proc")))
     }
 
-    fn for_database(db_path: PathBuf) -> Self {
+    fn for_database(db_path: PathBuf, proc_root: Option<PathBuf>) -> Self {
         Self {
             db_path,
+            proc_root,
             connection: None,
             states: HashMap::new(),
         }
@@ -96,7 +99,12 @@ impl Watcher {
 
     #[cfg(test)]
     fn for_test(db_path: PathBuf) -> Self {
-        Self::for_database(db_path)
+        Self::for_database(db_path, None)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_proc(db_path: PathBuf, proc_root: PathBuf) -> Self {
+        Self::for_database(db_path, Some(proc_root))
     }
 
     pub fn scan(&mut self) -> io::Result<Vec<ReadySession>> {
@@ -111,6 +119,11 @@ impl Watcher {
         let statuses = {
             let connection = self.connection()?;
             read_statuses(connection)?
+        };
+
+        let running = match &self.proc_root {
+            Some(proc_root) => Some(running_opencode_directories(proc_root)?),
+            None => None,
         };
 
         let mut ready = Vec::new();
@@ -155,6 +168,12 @@ impl Watcher {
             self.states.insert(status.id, next);
         }
         self.states.retain(|id, _| active.contains(id));
+
+        if let Some(running) = running {
+            ready.retain(|session| {
+                running.contains(&directory_key(Path::new(&session.directory)))
+            });
+        }
         Ok(ready)
     }
 
@@ -174,6 +193,66 @@ impl Watcher {
             .as_ref()
             .ok_or_else(|| io::Error::other("database connection unavailable"))
     }
+}
+
+fn running_opencode_directories(
+    proc_root: &Path,
+) -> io::Result<HashSet<PathBuf>> {
+    let mut directories = HashSet::new();
+    for entry in fs::read_dir(proc_root)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok()
+        else {
+            continue;
+        };
+        let path = proc_root.join(pid.to_string());
+        if !is_live_opencode(&path) {
+            continue;
+        }
+        if let Some(directory) = process_directory(&path) {
+            directories.insert(directory_key(&directory));
+        }
+    }
+    Ok(directories)
+}
+
+fn is_live_opencode(proc_path: &Path) -> bool {
+    let Ok(data) = fs::read_to_string(proc_path.join("stat")) else {
+        return false;
+    };
+    let Some((comm, state)) = parse_stat(&data) else {
+        return false;
+    };
+    comm == OPENCODE_COMMAND && !matches!(state, 'Z' | 'X' | 'x')
+}
+
+fn parse_stat(data: &str) -> Option<(&str, char)> {
+    let open = data.find('(')?;
+    let close = data.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let comm = data.get(open + 1..close)?;
+    let state = data
+        .get(close + 1..)?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()?;
+    Some((comm, state))
+}
+
+fn process_directory(proc_path: &Path) -> Option<PathBuf> {
+    let cwd = fs::read_link(proc_path.join("cwd")).ok()?;
+    let cwd = cwd.to_string_lossy();
+    let cwd = cwd.strip_suffix(" (deleted)").unwrap_or(&cwd);
+    Some(PathBuf::from(cwd))
+}
+
+fn directory_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn read_statuses(connection: &Connection) -> io::Result<Vec<SessionStatus>> {
@@ -370,6 +449,42 @@ mod tests {
         }
     }
 
+    struct FakeProc {
+        root: PathBuf,
+    }
+
+    impl FakeProc {
+        fn new() -> Self {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let root = env::temp_dir()
+                .join(format!("wakeup-proc-{}-{id}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn add(&self, pid: u32, comm: &str, state: char, cwd: &Path) {
+            let dir = self.root.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("stat"),
+                format!("{pid} ({comm}) {state} 1 1 1"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+        }
+
+        fn remove(&self, pid: u32) {
+            fs::remove_dir_all(self.root.join(pid.to_string())).unwrap();
+        }
+    }
+
+    impl Drop for FakeProc {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn user_message() -> &'static str {
         r#"{"role":"user"}"#
     }
@@ -433,6 +548,99 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn finds_directories_of_running_opencode_instances() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(10, "opencode", 'S', &project);
+        proc.add(11, "opencode", 'Z', &project);
+        proc.add(12, "bash", 'S', &project);
+
+        let directories = running_opencode_directories(&proc.root).unwrap();
+
+        assert_eq!(directories, HashSet::from([directory_key(&project)]));
+    }
+
+    #[test]
+    fn does_not_notify_when_opencode_instance_quit() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(10, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+        let start = Instant::now();
+
+        assert!(watcher.scan_at(start).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+
+        proc.remove(10);
+
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(36))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn notifies_when_opencode_instance_is_still_running() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(10, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+        let start = Instant::now();
+
+        assert!(watcher.scan_at(start).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+
+        let ready = watcher.scan_at(start + Duration::from_secs(36)).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
     }
 
     #[test]
