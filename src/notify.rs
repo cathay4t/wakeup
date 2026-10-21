@@ -1,15 +1,24 @@
 use std::{io, process::Command, time::Duration};
 
-use crate::monitor::FinishedTask;
+use crate::{monitor::FinishedTask, opencode::ReadySession};
 
-pub fn send(task: &FinishedTask) -> io::Result<()> {
-    let (summary, body) = message(task);
+pub fn send_task(task: &FinishedTask) -> io::Result<()> {
+    let (summary, body) = task_message(task);
+    send(&summary, &body)
+}
+
+pub fn send_opencode(session: &ReadySession) -> io::Result<()> {
+    let (summary, body) = opencode_message(session);
+    send(&summary, &body)
+}
+
+fn send(summary: &str, body: &str) -> io::Result<()> {
     let status = Command::new("notify-send")
         .arg("--app-name=wakeup")
         .arg("--urgency=normal")
         .arg("--")
-        .arg(&summary)
-        .arg(&body)
+        .arg(summary)
+        .arg(body)
         .status()?;
     if status.success() {
         Ok(())
@@ -20,7 +29,7 @@ pub fn send(task: &FinishedTask) -> io::Result<()> {
     }
 }
 
-fn message(task: &FinishedTask) -> (String, String) {
+fn task_message(task: &FinishedTask) -> (String, String) {
     (
         format!(
             "{} finished ({})",
@@ -28,6 +37,13 @@ fn message(task: &FinishedTask) -> (String, String) {
             format_duration(task.duration)
         ),
         format!("Command: {}", task.command_line),
+    )
+}
+
+fn opencode_message(session: &ReadySession) -> (String, String) {
+    (
+        "opencode is waiting for input".to_owned(),
+        format!("{}\n{}", session.title, session.directory),
     )
 }
 
@@ -64,10 +80,23 @@ mod tests {
     #[test]
     fn message_contains_full_command_line() {
         let (summary, body) =
-            message(&task("wget -c https://example.com/file"));
+            task_message(&task("wget -c https://example.com/file"));
 
         assert_eq!(summary, "wget finished (1m 01s)");
         assert_eq!(body, "Command: wget -c https://example.com/file");
+    }
+
+    #[test]
+    fn opencode_message_contains_session_context() {
+        let session = ReadySession {
+            title: "Fix the build".to_owned(),
+            directory: "/home/user/project".to_owned(),
+        };
+
+        let (summary, body) = opencode_message(&session);
+
+        assert_eq!(summary, "opencode is waiting for input");
+        assert_eq!(body, "Fix the build\n/home/user/project");
     }
 
     #[test]

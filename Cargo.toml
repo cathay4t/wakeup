@@ -6,3 +6,4 @@ rust-version = "1.99"
 
 [dependencies]
 libc = "0.2"
+rusqlite = "0.37"
