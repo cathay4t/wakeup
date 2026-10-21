@@ -3,6 +3,7 @@
 mod monitor;
 mod notify;
 mod opencode;
+mod sway;
 
 use std::{thread, time::Duration};
 

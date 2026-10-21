@@ -78,6 +78,11 @@ struct SessionStatus {
     idle: bool,
 }
 
+struct OpencodeInstance {
+    pid: u32,
+    directory: PathBuf,
+}
+
 pub struct Watcher {
     db_path: PathBuf,
     proc_root: Option<PathBuf>,
@@ -110,10 +115,15 @@ impl Watcher {
     }
 
     pub fn scan(&mut self) -> io::Result<Vec<ReadySession>> {
-        self.scan_at(Instant::now())
+        let focused = crate::sway::focused_window_pid().ok().flatten();
+        self.scan_at(Instant::now(), focused)
     }
 
-    fn scan_at(&mut self, now: Instant) -> io::Result<Vec<ReadySession>> {
+    fn scan_at(
+        &mut self,
+        now: Instant,
+        focused_window: Option<u32>,
+    ) -> io::Result<Vec<ReadySession>> {
         if !self.db_path.is_file() {
             return Ok(Vec::new());
         }
@@ -123,10 +133,24 @@ impl Watcher {
             read_statuses(connection)?
         };
 
-        let running = match &self.proc_root {
-            Some(proc_root) => Some(running_opencode_directories(proc_root)?),
+        let instances = match &self.proc_root {
+            Some(proc_root) => Some(running_opencode_instances(proc_root)?),
             None => None,
         };
+
+        let focused_directories =
+            match (&instances, &self.proc_root, focused_window) {
+                (Some(instances), Some(proc_root), Some(window_pid)) => {
+                    instances
+                        .iter()
+                        .filter(|instance| {
+                            is_in_window(proc_root, instance.pid, window_pid)
+                        })
+                        .map(|instance| instance.directory.clone())
+                        .collect::<HashSet<_>>()
+                }
+                _ => HashSet::new(),
+            };
 
         let mut ready = Vec::new();
         let mut active = HashSet::new();
@@ -171,11 +195,19 @@ impl Watcher {
         }
         self.states.retain(|id, _| active.contains(id));
 
-        if let Some(running) = running {
+        if let Some(instances) = instances {
+            let running: HashSet<PathBuf> = instances
+                .into_iter()
+                .map(|instance| instance.directory)
+                .collect();
             ready.retain(|session| {
                 running.contains(&directory_key(Path::new(&session.directory)))
             });
         }
+        ready.retain(|session| {
+            !focused_directories
+                .contains(&directory_key(Path::new(&session.directory)))
+        });
         Ok(ready)
     }
 
@@ -197,10 +229,10 @@ impl Watcher {
     }
 }
 
-fn running_opencode_directories(
+fn running_opencode_instances(
     proc_root: &Path,
-) -> io::Result<HashSet<PathBuf>> {
-    let mut directories = HashSet::new();
+) -> io::Result<Vec<OpencodeInstance>> {
+    let mut instances = Vec::new();
     for entry in fs::read_dir(proc_root)? {
         let Ok(entry) = entry else {
             continue;
@@ -214,10 +246,52 @@ fn running_opencode_directories(
             continue;
         }
         if let Some(directory) = process_directory(&path) {
-            directories.insert(directory_key(&directory));
+            instances.push(OpencodeInstance {
+                pid,
+                directory: directory_key(&directory),
+            });
         }
     }
-    Ok(directories)
+    Ok(instances)
+}
+
+fn is_in_window(proc_root: &Path, pid: u32, window_pid: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..=64 {
+        if current == window_pid {
+            return true;
+        }
+        if current <= 1 {
+            return false;
+        }
+        let Some(parent) = process_parent(proc_root, current) else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn process_parent(proc_root: &Path, pid: u32) -> Option<u32> {
+    let data = fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))
+        .ok()?;
+    parse_ppid(&data)
+}
+
+fn parse_ppid(data: &str) -> Option<u32> {
+    let open = data.find('(')?;
+    let close = data.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    data.get(close + 1..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn is_live_opencode(proc_path: &Path) -> bool {
@@ -465,12 +539,19 @@ mod tests {
             Self { root }
         }
 
-        fn add(&self, pid: u32, comm: &str, state: char, cwd: &Path) {
+        fn add(
+            &self,
+            pid: u32,
+            ppid: u32,
+            comm: &str,
+            state: char,
+            cwd: &Path,
+        ) {
             let dir = self.root.join(pid.to_string());
             fs::create_dir_all(&dir).unwrap();
             fs::write(
                 dir.join("stat"),
-                format!("{pid} ({comm}) {state} 1 1 1"),
+                format!("{pid} ({comm}) {state} {ppid} 1 1"),
             )
             .unwrap();
             std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
@@ -521,7 +602,7 @@ mod tests {
         let mut watcher = Watcher::for_test(db.path.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
@@ -529,41 +610,59 @@ mod tests {
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(5))
+                .scan_at(start + Duration::from_secs(5), None)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(34))
+                .scan_at(start + Duration::from_secs(34), None)
                 .unwrap()
                 .is_empty()
         );
 
-        let ready = watcher.scan_at(start + Duration::from_secs(36)).unwrap();
+        let ready = watcher
+            .scan_at(start + Duration::from_secs(36), None)
+            .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
         assert_eq!(ready[0].directory, "/tmp/project");
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(100))
+                .scan_at(start + Duration::from_secs(100), None)
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn finds_directories_of_running_opencode_instances() {
+    fn finds_running_opencode_instances() {
         let proc = FakeProc::new();
         let project = proc.root.join("project");
         fs::create_dir_all(&project).unwrap();
-        proc.add(10, "opencode", 'S', &project);
-        proc.add(11, "opencode", 'Z', &project);
-        proc.add(12, "bash", 'S', &project);
+        proc.add(10, 1, "opencode", 'S', &project);
+        proc.add(11, 1, "opencode", 'Z', &project);
+        proc.add(12, 1, "bash", 'S', &project);
 
-        let directories = running_opencode_directories(&proc.root).unwrap();
+        let instances = running_opencode_instances(&proc.root).unwrap();
 
-        assert_eq!(directories, HashSet::from([directory_key(&project)]));
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].pid, 10);
+        assert_eq!(instances[0].directory, directory_key(&project));
+    }
+
+    #[test]
+    fn walks_process_ancestry_to_window() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
+        assert!(is_in_window(&proc.root, 10, 5));
+        assert!(!is_in_window(&proc.root, 10, 99));
+        assert!(!is_in_window(&proc.root, 10, 7));
     }
 
     #[test]
@@ -571,7 +670,7 @@ mod tests {
         let proc = FakeProc::new();
         let project = proc.root.join("project");
         fs::create_dir_all(&project).unwrap();
-        proc.add(10, "opencode", 'S', &project);
+        proc.add(10, 1, "opencode", 'S', &project);
 
         let db = TestDb::new();
         db.session("root", None, project.to_str().unwrap(), "Fix the bug");
@@ -586,14 +685,14 @@ mod tests {
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(5))
+                .scan_at(start + Duration::from_secs(5), None)
                 .unwrap()
                 .is_empty()
         );
@@ -602,7 +701,7 @@ mod tests {
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(36))
+                .scan_at(start + Duration::from_secs(36), None)
                 .unwrap()
                 .is_empty()
         );
@@ -613,7 +712,7 @@ mod tests {
         let proc = FakeProc::new();
         let project = proc.root.join("project");
         fs::create_dir_all(&project).unwrap();
-        proc.add(10, "opencode", 'S', &project);
+        proc.add(10, 1, "opencode", 'S', &project);
 
         let db = TestDb::new();
         db.session("root", None, project.to_str().unwrap(), "Fix the bug");
@@ -628,19 +727,102 @@ mod tests {
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(5))
+                .scan_at(start + Duration::from_secs(5), None)
                 .unwrap()
                 .is_empty()
         );
 
-        let ready = watcher.scan_at(start + Duration::from_secs(36)).unwrap();
+        let ready = watcher
+            .scan_at(start + Duration::from_secs(36), None)
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
+    }
+
+    #[test]
+    fn does_not_notify_when_opencode_window_is_focused() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+        let start = Instant::now();
+
+        assert!(watcher.scan_at(start, Some(5)).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(5), Some(5))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(36), Some(5))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn notifies_when_another_window_is_focused() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+        let start = Instant::now();
+
+        assert!(watcher.scan_at(start, Some(99)).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+        assert!(
+            watcher
+                .scan_at(start + Duration::from_secs(5), Some(99))
+                .unwrap()
+                .is_empty()
+        );
+        let ready = watcher
+            .scan_at(start + Duration::from_secs(36), Some(99))
+            .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
     }
@@ -659,14 +841,14 @@ mod tests {
         let mut watcher = Watcher::for_test(db.path.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(5))
+                .scan_at(start + Duration::from_secs(5), None)
                 .unwrap()
                 .is_empty()
         );
@@ -674,13 +856,13 @@ mod tests {
         db.message("user-2", "root", 4, user_message());
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(20))
+                .scan_at(start + Duration::from_secs(20), None)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(40))
+                .scan_at(start + Duration::from_secs(40), None)
                 .unwrap()
                 .is_empty()
         );
@@ -700,10 +882,10 @@ mod tests {
         let mut watcher = Watcher::for_test(db.path.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(31))
+                .scan_at(start + Duration::from_secs(31), None)
                 .unwrap()
                 .is_empty()
         );
@@ -723,7 +905,7 @@ mod tests {
         let mut watcher = Watcher::for_test(db.path.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
@@ -731,7 +913,7 @@ mod tests {
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(31))
+                .scan_at(start + Duration::from_secs(31), None)
                 .unwrap()
                 .is_empty()
         );
@@ -752,20 +934,20 @@ mod tests {
         let mut watcher = Watcher::for_test(db.path.clone());
         let start = Instant::now();
 
-        assert!(watcher.scan_at(start).unwrap().is_empty());
+        assert!(watcher.scan_at(start, None).unwrap().is_empty());
         db.connection
             .execute("DELETE FROM part WHERE id = 'tool'", [])
             .unwrap();
 
         assert!(
             watcher
-                .scan_at(start + Duration::from_secs(5))
+                .scan_at(start + Duration::from_secs(5), None)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
             watcher
-                .scan_at(start + Duration::from_secs(36))
+                .scan_at(start + Duration::from_secs(36), None)
                 .unwrap()
                 .len(),
             1

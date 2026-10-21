@@ -10,7 +10,8 @@ It watches two things:
   60 seconds.
 - **opencode sessions** — top-level [opencode](https://opencode.ai) sessions
   that have been waiting for input for more than 30 seconds while an opencode
-  instance is still running in the session's directory.
+  instance is still running in the session's directory. If the session's
+  opencode window is focused, no notification is sent.
 
 Notifications are delivered through `notify-send`, with the application name
 `wakeup`.
@@ -21,6 +22,8 @@ Notifications are delivered through `notify-send`, with the application name
 - `notify-send` from libnotify
 - Rust 1.99 or newer (edition 2024)
 - `opencode` on `PATH` for session monitoring (optional)
+- `swaymsg` on `PATH` to suppress notifications for focused opencode windows
+  (optional, Sway only)
 
 ## Build
 
