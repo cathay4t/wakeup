@@ -24,6 +24,7 @@ struct TrackedProcess {
 struct ProcessStat {
     comm: String,
     state: char,
+    ppid: u32,
     start_ticks: u64,
 }
 
@@ -101,11 +102,14 @@ impl Monitor {
             }
         }
 
-        for (pid, stat) in seen {
+        for (&pid, stat) in &seen {
             if self.tracked.contains_key(&pid) {
                 continue;
             }
-            if is_dead(stat.state) || !is_watched(&stat.comm) {
+            if is_dead(stat.state)
+                || !is_watched(&stat.comm)
+                || has_watched_ancestor(pid, &seen)
+            {
                 continue;
             }
             let cmdline_path =
@@ -116,7 +120,7 @@ impl Monitor {
                 pid,
                 TrackedProcess {
                     start_ticks: stat.start_ticks,
-                    name: stat.comm,
+                    name: stat.comm.clone(),
                     command_line,
                 },
             );
@@ -145,6 +149,26 @@ impl Monitor {
 
 fn is_watched(comm: &str) -> bool {
     WATCHED_COMMANDS.contains(&comm)
+}
+
+fn has_watched_ancestor(pid: u32, seen: &HashMap<u32, ProcessStat>) -> bool {
+    let mut current = seen.get(&pid).map(|stat| stat.ppid);
+    for _ in 0..=seen.len() {
+        let Some(parent) = current else {
+            return false;
+        };
+        if parent == pid {
+            return false;
+        }
+        let Some(stat) = seen.get(&parent) else {
+            return false;
+        };
+        if is_watched(&stat.comm) {
+            return true;
+        }
+        current = Some(stat.ppid);
+    }
+    false
 }
 
 fn is_dead(state: char) -> bool {
@@ -199,10 +223,12 @@ fn parse_proc_stat(data: &str) -> Option<ProcessStat> {
     let rest = data.get(close + 1..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let state = fields.first()?.chars().next()?;
+    let ppid = fields.get(1)?.parse().ok()?;
     let start_ticks = fields.get(19)?.parse().ok()?;
     Some(ProcessStat {
         comm: comm.to_owned(),
         state,
+        ppid,
         start_ticks,
     })
 }
@@ -266,11 +292,12 @@ mod tests {
 
     fn stat_line(
         pid: u32,
+        ppid: u32,
         comm: &str,
         state: char,
         start_ticks: u64,
     ) -> String {
-        let mut fields = vec![state.to_string()];
+        let mut fields = vec![state.to_string(), ppid.to_string()];
         fields.resize(19, "0".to_owned());
         fields.push(start_ticks.to_string());
         format!("{pid} ({comm}) {}", fields.join(" "))
@@ -283,8 +310,10 @@ mod tests {
     impl FakeProc {
         fn new() -> Self {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("wakeup-proc-{}-{id}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "wakeup-monitor-proc-{}-{id}",
+                std::process::id()
+            ));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).unwrap();
             Self { root }
@@ -293,6 +322,7 @@ mod tests {
         fn add(
             &self,
             pid: u32,
+            ppid: u32,
             comm: &str,
             state: char,
             start_ticks: u64,
@@ -302,7 +332,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(
                 dir.join("stat"),
-                stat_line(pid, comm, state, start_ticks),
+                stat_line(pid, ppid, comm, state, start_ticks),
             )
             .unwrap();
             let mut cmdline = Vec::new();
@@ -326,12 +356,18 @@ mod tests {
 
     #[test]
     fn parses_proc_stat_with_parentheses_in_comm() {
-        let stat =
-            parse_proc_stat(&stat_line(123, "name) with (parens", 'S', 4_567))
-                .unwrap();
+        let stat = parse_proc_stat(&stat_line(
+            123,
+            1,
+            "name) with (parens",
+            'S',
+            4_567,
+        ))
+        .unwrap();
 
         assert_eq!(stat.comm, "name) with (parens");
         assert_eq!(stat.state, 'S');
+        assert_eq!(stat.ppid, 1);
         assert_eq!(stat.start_ticks, 4_567);
     }
 
@@ -357,7 +393,7 @@ mod tests {
     #[test]
     fn ignores_tasks_shorter_than_a_minute() {
         let proc = FakeProc::new();
-        proc.add(42, "wget", 'S', 0, &["wget", "-c", "url"]);
+        proc.add(42, 1, "wget", 'S', 0, &["wget", "-c", "url"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
@@ -369,7 +405,7 @@ mod tests {
     #[test]
     fn detects_finished_long_task() {
         let proc = FakeProc::new();
-        proc.add(42, "wget", 'S', 0, &["wget", "-c", "url"]);
+        proc.add(42, 1, "wget", 'S', 0, &["wget", "-c", "url"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
@@ -385,7 +421,7 @@ mod tests {
     #[test]
     fn detects_finished_task_that_started_before_monitor() {
         let proc = FakeProc::new();
-        proc.add(42, "make", 'S', 0, &["make", "-j8", "all"]);
+        proc.add(42, 1, "make", 'S', 0, &["make", "-j8", "all"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(
@@ -406,11 +442,11 @@ mod tests {
     #[test]
     fn detects_zombie_as_finished() {
         let proc = FakeProc::new();
-        proc.add(42, "xz", 'S', 0, &["xz", "-9", "file"]);
+        proc.add(42, 1, "xz", 'S', 0, &["xz", "-9", "file"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
-        proc.add(42, "xz", 'Z', 0, &["xz", "-9", "file"]);
+        proc.add(42, 1, "xz", 'Z', 0, &["xz", "-9", "file"]);
 
         let finished = monitor.scan_at(Duration::from_secs(70)).unwrap();
         assert_eq!(finished.len(), 1);
@@ -421,7 +457,7 @@ mod tests {
     #[test]
     fn ignores_unwatched_commands() {
         let proc = FakeProc::new();
-        proc.add(42, "bash", 'S', 0, &["bash", "-c", "sleep 120"]);
+        proc.add(42, 1, "bash", 'S', 0, &["bash", "-c", "sleep 120"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
@@ -431,13 +467,74 @@ mod tests {
     }
 
     #[test]
-    fn detects_old_process_when_pid_is_reused() {
+    fn ignores_child_make_while_parent_make_runs() {
         let proc = FakeProc::new();
-        proc.add(42, "wget", 'S', 0, &["wget", "old"]);
+        proc.add(100, 1, "make", 'S', 0, &["make", "pacman-pkg"]);
+        proc.add(101, 100, "make", 'S', 0, &["make", "-f", "Makefile.build"]);
         let mut monitor = Monitor::with_proc_root(proc.root.clone());
 
         assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
-        proc.add(42, "wget", 'S', 3_000, &["wget", "new"]);
+        assert_eq!(monitor.tracked.len(), 1);
+        proc.remove(101);
+
+        assert!(monitor.scan_at(Duration::from_secs(70)).unwrap().is_empty());
+
+        proc.remove(100);
+        let finished = monitor.scan_at(Duration::from_secs(71)).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].command_line, "make pacman-pkg");
+    }
+
+    #[test]
+    fn ignores_watched_command_behind_unwatched_ancestor() {
+        let proc = FakeProc::new();
+        proc.add(100, 1, "make", 'S', 0, &["make", "pacman-pkg"]);
+        proc.add(101, 100, "bash", 'S', 0, &["bash", "-c", "make"]);
+        proc.add(102, 101, "make", 'S', 0, &["make", "modules_install"]);
+        let mut monitor = Monitor::with_proc_root(proc.root.clone());
+
+        assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
+        assert_eq!(monitor.tracked.len(), 1);
+        proc.remove(102);
+        proc.remove(101);
+
+        assert!(monitor.scan_at(Duration::from_secs(70)).unwrap().is_empty());
+
+        proc.remove(100);
+        let finished = monitor.scan_at(Duration::from_secs(71)).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].command_line, "make pacman-pkg");
+    }
+
+    #[test]
+    fn tracks_unrelated_top_level_commands_independently() {
+        let proc = FakeProc::new();
+        proc.add(100, 1, "make", 'S', 0, &["make", "pacman-pkg"]);
+        proc.add(200, 1, "make", 'S', 0, &["make", "install"]);
+        let mut monitor = Monitor::with_proc_root(proc.root.clone());
+
+        assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
+        assert_eq!(monitor.tracked.len(), 2);
+        proc.remove(200);
+
+        let finished = monitor.scan_at(Duration::from_secs(70)).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].command_line, "make install");
+
+        proc.remove(100);
+        let finished = monitor.scan_at(Duration::from_secs(71)).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].command_line, "make pacman-pkg");
+    }
+
+    #[test]
+    fn detects_old_process_when_pid_is_reused() {
+        let proc = FakeProc::new();
+        proc.add(42, 1, "wget", 'S', 0, &["wget", "old"]);
+        let mut monitor = Monitor::with_proc_root(proc.root.clone());
+
+        assert!(monitor.scan_at(Duration::from_secs(10)).unwrap().is_empty());
+        proc.add(42, 1, "wget", 'S', 3_000, &["wget", "new"]);
 
         let finished = monitor.scan_at(Duration::from_secs(70)).unwrap();
         assert_eq!(finished.len(), 1);
