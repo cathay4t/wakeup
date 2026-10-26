@@ -13,7 +13,8 @@ It watches two things:
   still running in the session's directory. A notification is sent immediately
   when the result arrives, unless the session's opencode window is focused. If
   the window was focused when the result arrived, no notification is sent for
-  that turn.
+  that turn. Clicking the notification switches to the session's window (Sway
+  only, when the window can be identified).
 
 Notifications are delivered through `notify-send`, with the application name
 `wakeup`.

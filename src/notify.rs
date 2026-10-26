@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, process::Command, time::Duration};
+use std::{io, process::Command, thread, time::Duration};
 
 use crate::{monitor::FinishedTask, opencode::ReadySession};
 
@@ -11,7 +11,21 @@ pub fn send_task(task: &FinishedTask) -> io::Result<()> {
 
 pub fn send_opencode(session: &ReadySession) -> io::Result<()> {
     let (summary, body) = opencode_message(session);
-    send(&summary, &body)
+    let window_id = session.window_id;
+    thread::Builder::new()
+        .name("wakeup-opencode-notification".to_owned())
+        .spawn(move || {
+            let result = match window_id {
+                Some(window_id) => {
+                    send_with_window_action(&summary, &body, window_id)
+                }
+                None => send(&summary, &body),
+            };
+            if let Err(error) = result {
+                eprintln!("wakeup: failed to notify about opencode: {error}");
+            }
+        })
+        .map(|_| ())
 }
 
 fn send(summary: &str, body: &str) -> io::Result<()> {
@@ -29,6 +43,41 @@ fn send(summary: &str, body: &str) -> io::Result<()> {
             "notify-send exited with {status}"
         )))
     }
+}
+
+fn send_with_window_action(
+    summary: &str,
+    body: &str,
+    window_id: u64,
+) -> io::Result<()> {
+    let output = Command::new("notify-send")
+        .arg("--app-name=wakeup")
+        .arg("--urgency=normal")
+        .arg("--wait")
+        .arg("--action=default=Switch to window")
+        .arg("--")
+        .arg(summary)
+        .arg(body)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "notify-send exited with {}",
+            output.status
+        )));
+    }
+    if action_was_invoked(&output.stdout, "default") {
+        crate::sway::focus(window_id).map_err(|error| {
+            io::Error::other(format!(
+                "failed to focus window {window_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn action_was_invoked(stdout: &[u8], action: &str) -> bool {
+    std::str::from_utf8(stdout)
+        .is_ok_and(|stdout| stdout.lines().any(|line| line.trim() == action))
 }
 
 fn task_message(task: &FinishedTask) -> (String, String) {
@@ -93,12 +142,20 @@ mod tests {
         let session = ReadySession {
             title: "Fix the build".to_owned(),
             directory: "/home/user/project".to_owned(),
+            window_id: None,
         };
 
         let (summary, body) = opencode_message(&session);
 
         assert_eq!(summary, "opencode is waiting for input");
         assert_eq!(body, "Fix the build\n/home/user/project");
+    }
+
+    #[test]
+    fn recognizes_invoked_default_action() {
+        assert!(action_was_invoked(b"default\n", "default"));
+        assert!(!action_was_invoked(b"", "default"));
+        assert!(!action_was_invoked(b"other\n", "default"));
     }
 
     #[test]

@@ -10,6 +10,8 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::sway::Window;
+
 const OPENCODE_COMMAND: &str = "opencode";
 
 const STATUS_QUERY: &str = r#"
@@ -62,6 +64,7 @@ WHERE s.parent_id IS NULL
 pub struct ReadySession {
     pub title: String,
     pub directory: String,
+    pub window_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,13 +118,22 @@ impl Watcher {
     }
 
     pub fn scan(&mut self) -> io::Result<Vec<ReadySession>> {
-        let focused = crate::sway::focused_window_pid().ok().flatten();
-        self.scan_at(focused)
+        let windows = crate::sway::windows().unwrap_or_default();
+        self.scan_with_windows(windows.focused_pid, &windows.windows)
     }
 
+    #[cfg(test)]
     fn scan_at(
         &mut self,
         focused_window: Option<u32>,
+    ) -> io::Result<Vec<ReadySession>> {
+        self.scan_with_windows(focused_window, &[])
+    }
+
+    fn scan_with_windows(
+        &mut self,
+        focused_window: Option<u32>,
+        windows: &[Window],
     ) -> io::Result<Vec<ReadySession>> {
         if !self.db_path.is_file() {
             return Ok(Vec::new());
@@ -151,12 +163,28 @@ impl Watcher {
                 _ => HashSet::new(),
             };
 
+        let mut window_ids = HashMap::new();
+        if let (Some(instances), Some(proc_root)) =
+            (&instances, &self.proc_root)
+        {
+            for instance in instances {
+                if let Some(window_id) =
+                    window_for_pid(proc_root, instance.pid, windows)
+                {
+                    window_ids
+                        .entry(instance.directory.clone())
+                        .or_insert(window_id);
+                }
+            }
+        }
+
         let mut ready = Vec::new();
         let mut active = HashSet::new();
         for status in statuses {
             active.insert(status.id.clone());
-            let session_focused = focused_directories
-                .contains(&directory_key(Path::new(&status.directory)));
+            let directory = directory_key(Path::new(&status.directory));
+            let session_focused = focused_directories.contains(&directory);
+            let window_id = window_ids.get(&directory).copied();
             let next = match self.states.get(&status.id) {
                 None if status.idle => State::Idle {
                     latest_user: status.latest_user.clone(),
@@ -167,6 +195,7 @@ impl Watcher {
                         ready.push(ReadySession {
                             title: status.title.clone(),
                             directory: status.directory.clone(),
+                            window_id,
                         });
                     }
                     State::Idle {
@@ -181,6 +210,7 @@ impl Watcher {
                         ready.push(ReadySession {
                             title: status.title.clone(),
                             directory: status.directory.clone(),
+                            window_id,
                         });
                     }
                     State::Idle {
@@ -272,6 +302,30 @@ fn is_in_window(proc_root: &Path, pid: u32, window_pid: u32) -> bool {
         current = parent;
     }
     false
+}
+
+fn window_for_pid(
+    proc_root: &Path,
+    pid: u32,
+    windows: &[Window],
+) -> Option<u64> {
+    let mut current = pid;
+    for _ in 0..=64 {
+        if let Some(window) =
+            windows.iter().find(|window| window.pid == current)
+        {
+            return Some(window.id);
+        }
+        if current <= 1 {
+            return None;
+        }
+        let parent = process_parent(proc_root, current)?;
+        if parent == current {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 fn process_parent(proc_root: &Path, pid: u32) -> Option<u32> {
@@ -642,6 +696,58 @@ mod tests {
         assert!(is_in_window(&proc.root, 10, 5));
         assert!(!is_in_window(&proc.root, 10, 99));
         assert!(!is_in_window(&proc.root, 10, 7));
+    }
+
+    #[test]
+    fn maps_process_ancestry_to_window_id() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+        let windows = [Window { pid: 5, id: 63 }];
+
+        assert_eq!(window_for_pid(&proc.root, 10, &windows), Some(63));
+        assert_eq!(window_for_pid(&proc.root, 10, &[]), None);
+        assert_eq!(
+            window_for_pid(&proc.root, 10, &[Window { pid: 99, id: 7 }]),
+            None
+        );
+    }
+
+    #[test]
+    fn attaches_window_id_to_ready_session() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+
+        let ready = watcher
+            .scan_with_windows(None, &[Window { pid: 5, id: 63 }])
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].window_id, Some(63));
     }
 
     #[test]
