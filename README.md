@@ -9,10 +9,11 @@ It watches two things:
   `/proc`. A notification is sent when one exits, provided it ran for at least
   60 seconds.
 - **opencode sessions** — top-level [opencode](https://opencode.ai) sessions
-  that have been waiting for input for more than 60 seconds while an opencode
-  instance is still running in the session's directory. If the session's
-  opencode window is focused, no notification is sent. Sending new input
-  cancels the pending notification.
+  that have finished and are waiting for input while an opencode instance is
+  still running in the session's directory. A notification is sent immediately
+  when the result arrives, unless the session's opencode window is focused. If
+  the window was focused when the result arrived, no notification is sent for
+  that turn.
 
 Notifications are delivered through `notify-send`, with the application name
 `wakeup`.
@@ -40,8 +41,9 @@ The binary is written to `target/release/wakeup`.
 ./target/release/wakeup
 ```
 
-The process polls every 30 seconds and logs to stderr. It does not fork into
-the background, so run it under your init system or a terminal multiplexer.
+The process checks opencode every 5 seconds and shell tasks every 30 seconds,
+and logs to stderr. It does not fork into the background, so run it under your
+init system or a terminal multiplexer.
 
 ## License
 

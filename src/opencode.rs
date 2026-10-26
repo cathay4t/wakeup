@@ -5,12 +5,11 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use rusqlite::{Connection, OpenFlags};
 
-const IDLE_NOTIFY_DELAY: Duration = Duration::from_secs(60);
 const OPENCODE_COMMAND: &str = "opencode";
 
 const STATUS_QUERY: &str = r#"
@@ -68,11 +67,7 @@ pub struct ReadySession {
 #[derive(Clone, Debug)]
 enum State {
     Busy,
-    Idle {
-        since: Instant,
-        notified: bool,
-        latest_user: Option<String>,
-    },
+    Idle { latest_user: Option<String> },
 }
 
 struct SessionStatus {
@@ -121,12 +116,11 @@ impl Watcher {
 
     pub fn scan(&mut self) -> io::Result<Vec<ReadySession>> {
         let focused = crate::sway::focused_window_pid().ok().flatten();
-        self.scan_at(Instant::now(), focused)
+        self.scan_at(focused)
     }
 
     fn scan_at(
         &mut self,
-        now: Instant,
         focused_window: Option<u32>,
     ) -> io::Result<Vec<ReadySession>> {
         if !self.db_path.is_file() {
@@ -161,55 +155,43 @@ impl Watcher {
         let mut active = HashSet::new();
         for status in statuses {
             active.insert(status.id.clone());
+            let session_focused = focused_directories
+                .contains(&directory_key(Path::new(&status.directory)));
             let next = match self.states.get(&status.id) {
                 None if status.idle => State::Idle {
-                    since: now,
-                    notified: true,
                     latest_user: status.latest_user.clone(),
                 },
                 None => State::Busy,
-                Some(State::Busy) if status.idle => State::Idle {
-                    since: now,
-                    notified: false,
-                    latest_user: status.latest_user.clone(),
-                },
-                Some(State::Busy) => State::Busy,
-                Some(State::Idle { latest_user, .. })
-                    if status.idle && latest_user != &status.latest_user =>
-                {
+                Some(State::Busy) if status.idle => {
+                    if !session_focused {
+                        ready.push(ReadySession {
+                            title: status.title.clone(),
+                            directory: status.directory.clone(),
+                        });
+                    }
                     State::Idle {
-                        since: now,
-                        notified: false,
                         latest_user: status.latest_user.clone(),
                     }
                 }
-                Some(State::Idle {
-                    since,
-                    notified: false,
-                    latest_user,
-                }) if status.idle
-                    && now.saturating_duration_since(*since)
-                        > IDLE_NOTIFY_DELAY =>
+                Some(State::Busy) => State::Busy,
+                Some(State::Idle { latest_user })
+                    if status.idle && latest_user != &status.latest_user =>
                 {
-                    ready.push(ReadySession {
-                        title: status.title,
-                        directory: status.directory,
-                    });
+                    if !session_focused {
+                        ready.push(ReadySession {
+                            title: status.title.clone(),
+                            directory: status.directory.clone(),
+                        });
+                    }
                     State::Idle {
-                        since: *since,
-                        notified: true,
+                        latest_user: status.latest_user.clone(),
+                    }
+                }
+                Some(State::Idle { latest_user }) if status.idle => {
+                    State::Idle {
                         latest_user: latest_user.clone(),
                     }
                 }
-                Some(State::Idle {
-                    since,
-                    notified,
-                    latest_user,
-                }) if status.idle => State::Idle {
-                    since: *since,
-                    notified: *notified,
-                    latest_user: latest_user.clone(),
-                },
                 Some(State::Idle { .. }) => State::Busy,
             };
             self.states.insert(status.id, next);
@@ -225,10 +207,6 @@ impl Watcher {
                 running.contains(&directory_key(Path::new(&session.directory)))
             });
         }
-        ready.retain(|session| {
-            !focused_directories
-                .contains(&directory_key(Path::new(&session.directory)))
-        });
         Ok(ready)
     }
 
@@ -611,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn notifies_after_waiting_over_sixty_seconds() {
+    fn notifies_immediately_when_idle_and_unfocused() {
         let db = TestDb::new();
         db.session("root", None, "/tmp/project", "Fix the bug");
         db.message("user", "root", 1, user_message());
@@ -622,39 +600,18 @@ mod tests {
             &assistant_message("user", None, None),
         );
         let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
 
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(64), None)
-                .unwrap()
-                .is_empty()
-        );
-
-        let ready = watcher
-            .scan_at(start + Duration::from_secs(66), None)
-            .unwrap();
+        let ready = watcher.scan_at(None).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
         assert_eq!(ready[0].directory, "/tmp/project");
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(100), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(watcher.scan_at(None).unwrap().is_empty());
     }
 
     #[test]
@@ -705,28 +662,17 @@ mod tests {
         );
         let mut watcher =
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
-        );
 
         proc.remove(10);
 
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(66), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
     }
 
     #[test]
@@ -747,23 +693,14 @@ mod tests {
         );
         let mut watcher =
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
-        );
 
-        let ready = watcher
-            .scan_at(start + Duration::from_secs(66), None)
-            .unwrap();
+        let ready = watcher.scan_at(None).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
     }
@@ -788,25 +725,14 @@ mod tests {
         );
         let mut watcher =
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, Some(5)).unwrap().is_empty());
+        assert!(watcher.scan_at(Some(5)).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), Some(5))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(66), Some(5))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(watcher.scan_at(Some(5)).unwrap().is_empty());
+        assert!(watcher.scan_at(Some(99)).unwrap().is_empty());
     }
 
     #[test]
@@ -829,30 +755,28 @@ mod tests {
         );
         let mut watcher =
             Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, Some(99)).unwrap().is_empty());
+        assert!(watcher.scan_at(Some(99)).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), Some(99))
-                .unwrap()
-                .is_empty()
-        );
-        let ready = watcher
-            .scan_at(start + Duration::from_secs(66), Some(99))
-            .unwrap();
+        let ready = watcher.scan_at(Some(99)).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
     }
 
     #[test]
-    fn does_not_notify_if_user_returns_before_grace_period() {
+    fn notifies_when_window_blurs_before_output_arrives() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "bash", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
         let db = TestDb::new();
-        db.session("root", None, "/tmp/project", "Fix the bug");
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
         db.message("user", "root", 1, user_message());
         db.message(
             "assistant",
@@ -860,38 +784,21 @@ mod tests {
             2,
             &assistant_message("user", None, None),
         );
-        let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(Some(5)).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
-        );
-
-        db.message("user-2", "root", 4, user_message());
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(20), None)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(66), None)
-                .unwrap()
-                .is_empty()
-        );
+        let ready = watcher.scan_at(Some(99)).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
     }
 
     #[test]
-    fn cancels_pending_notification_when_user_input_happened_between_scans() {
+    fn notifies_for_next_turn_after_user_input() {
         let db = TestDb::new();
         db.session("root", None, "/tmp/project", "Fix the bug");
         db.message("user", "root", 1, user_message());
@@ -902,19 +809,41 @@ mod tests {
             &assistant_message("user", None, None),
         );
         let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
+        assert_eq!(watcher.scan_at(None).unwrap().len(), 1);
+
+        db.message("user-2", "root", 4, user_message());
+        db.message(
+            "assistant-2",
+            "root",
+            5,
+            &assistant_message("user-2", Some("stop"), Some(6)),
         );
+        let ready = watcher.scan_at(None).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notifies_when_completion_happens_between_scans() {
+        let db = TestDb::new();
+        db.session("root", None, "/tmp/project", "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher = Watcher::for_test(db.path.clone());
+
+        assert!(watcher.scan_at(None).unwrap().is_empty());
 
         db.message("user-2", "root", 4, user_message());
         db.message(
@@ -924,23 +853,10 @@ mod tests {
             &assistant_message("user-2", Some("stop"), Some(6)),
         );
 
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(10), None)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(69), None)
-                .unwrap()
-                .is_empty()
-        );
-        let ready = watcher
-            .scan_at(start + Duration::from_secs(71), None)
-            .unwrap();
+        let ready = watcher.scan_at(None).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Fix the bug");
+        assert!(watcher.scan_at(None).unwrap().is_empty());
     }
 
     #[test]
@@ -955,15 +871,9 @@ mod tests {
             &assistant_message("user", Some("stop"), Some(3)),
         );
         let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(61), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
     }
 
     #[test]
@@ -978,20 +888,14 @@ mod tests {
             &assistant_message("user", None, None),
         );
         let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.update_message(
             "assistant",
             &assistant_message("user", Some("stop"), Some(3)),
         );
 
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(61), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(watcher.scan_at(None).unwrap().is_empty());
     }
 
     #[test]
@@ -1007,25 +911,12 @@ mod tests {
         );
         db.tool_part("tool", "assistant", "completed");
         let mut watcher = Watcher::for_test(db.path.clone());
-        let start = Instant::now();
 
-        assert!(watcher.scan_at(start, None).unwrap().is_empty());
+        assert!(watcher.scan_at(None).unwrap().is_empty());
         db.connection
             .execute("DELETE FROM part WHERE id = 'tool'", [])
             .unwrap();
 
-        assert!(
-            watcher
-                .scan_at(start + Duration::from_secs(5), None)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            watcher
-                .scan_at(start + Duration::from_secs(66), None)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(watcher.scan_at(None).unwrap().len(), 1);
     }
 }
