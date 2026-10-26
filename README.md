@@ -9,12 +9,15 @@ It watches two things:
   `/proc`. A notification is sent when one exits, provided it ran for at least
   60 seconds.
 - **opencode sessions** — top-level [opencode](https://opencode.ai) sessions
-  that have finished and are waiting for input while an opencode instance is
-  still running in the session's directory. A notification is sent immediately
-  when the result arrives, unless the session's opencode window is focused. If
-  the window was focused when the result arrived, no notification is sent for
-  that turn. Clicking the notification switches to the session's window (Sway
-  only, when the window can be identified).
+  that have finished and are waiting for input while an interactive opencode
+  instance is still running in the session's directory. An opencode instance
+  counts as interactive only when its parent process is a terminal or shell, so
+  sessions started by automation tools (such as `weiran`) are ignored. A
+  notification is sent immediately when the result arrives, unless the
+  session's opencode window is focused. If the window was focused when the
+  result arrived, no notification is sent for that turn. Clicking the
+  notification switches to the session's window (Sway only, when the window can
+  be identified).
 
 Notifications are delivered through `notify-send`, with the application name
 `wakeup`.

@@ -13,6 +13,40 @@ use rusqlite::{Connection, OpenFlags};
 use crate::sway::Window;
 
 const OPENCODE_COMMAND: &str = "opencode";
+const TERMINAL_COMMANDS: &[&str] = &[
+    "alacritty",
+    "bash",
+    "csh",
+    "dash",
+    "elvish",
+    "fish",
+    "foot",
+    "gnome-terminal",
+    "gnome-terminal-server",
+    "guake",
+    "kitty",
+    "konsole",
+    "ksh",
+    "lxterminal",
+    "mksh",
+    "nu",
+    "qterminal",
+    "rxvt",
+    "screen",
+    "sh",
+    "st",
+    "terminator",
+    "terminology",
+    "tilix",
+    "tmux",
+    "urxvt",
+    "wezterm",
+    "wezterm-gui",
+    "xfce4-terminal",
+    "xonsh",
+    "xterm",
+    "zsh",
+];
 
 const STATUS_QUERY: &str = r#"
 SELECT
@@ -84,6 +118,7 @@ struct SessionStatus {
 struct OpencodeInstance {
     pid: u32,
     directory: PathBuf,
+    interactive: bool,
 }
 
 pub struct Watcher {
@@ -155,7 +190,12 @@ impl Watcher {
                     instances
                         .iter()
                         .filter(|instance| {
-                            is_in_window(proc_root, instance.pid, window_pid)
+                            instance.interactive
+                                && is_in_window(
+                                    proc_root,
+                                    instance.pid,
+                                    window_pid,
+                                )
                         })
                         .map(|instance| instance.directory.clone())
                         .collect::<HashSet<_>>()
@@ -167,7 +207,9 @@ impl Watcher {
         if let (Some(instances), Some(proc_root)) =
             (&instances, &self.proc_root)
         {
-            for instance in instances {
+            for instance in
+                instances.iter().filter(|instance| instance.interactive)
+            {
                 if let Some(window_id) =
                     window_for_pid(proc_root, instance.pid, windows)
                 {
@@ -231,6 +273,7 @@ impl Watcher {
         if let Some(instances) = instances {
             let running: HashSet<PathBuf> = instances
                 .into_iter()
+                .filter(|instance| instance.interactive)
                 .map(|instance| instance.directory)
                 .collect();
             ready.retain(|session| {
@@ -278,10 +321,38 @@ fn running_opencode_instances(
             instances.push(OpencodeInstance {
                 pid,
                 directory: directory_key(&directory),
+                interactive: parent_is_terminal(proc_root, pid),
             });
         }
     }
     Ok(instances)
+}
+
+fn parent_is_terminal(proc_root: &Path, pid: u32) -> bool {
+    let Some(parent) = process_parent(proc_root, pid) else {
+        return false;
+    };
+    is_terminal_process(&proc_root.join(parent.to_string()))
+}
+
+fn is_terminal_process(proc_path: &Path) -> bool {
+    process_program(proc_path)
+        .is_some_and(|name| TERMINAL_COMMANDS.contains(&name.as_str()))
+}
+
+fn process_program(proc_path: &Path) -> Option<String> {
+    fs::read_link(proc_path.join("exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .or_else(|| process_comm(proc_path))
+}
+
+fn process_comm(proc_path: &Path) -> Option<String> {
+    let data = fs::read_to_string(proc_path.join("stat")).ok()?;
+    parse_stat(&data).map(|(comm, _)| comm.to_owned())
 }
 
 fn is_in_window(proc_root: &Path, pid: u32, window_pid: u32) -> bool {
@@ -609,6 +680,17 @@ mod tests {
             )
             .unwrap();
             std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+            std::os::unix::fs::symlink(
+                Path::new("/usr/bin").join(comm),
+                dir.join("exe"),
+            )
+            .unwrap();
+        }
+
+        fn set_exe(&self, pid: u32, exe: &str) {
+            let link = self.root.join(pid.to_string()).join("exe");
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(exe, link).unwrap();
         }
 
         fn remove(&self, pid: u32) {
@@ -755,7 +837,8 @@ mod tests {
         let proc = FakeProc::new();
         let project = proc.root.join("project");
         fs::create_dir_all(&project).unwrap();
-        proc.add(10, 1, "opencode", 'S', &project);
+        proc.add(100, 1, "bash", 'S', &project);
+        proc.add(10, 100, "opencode", 'S', &project);
 
         let db = TestDb::new();
         db.session("root", None, project.to_str().unwrap(), "Fix the bug");
@@ -786,7 +869,71 @@ mod tests {
         let proc = FakeProc::new();
         let project = proc.root.join("project");
         fs::create_dir_all(&project).unwrap();
-        proc.add(10, 1, "opencode", 'S', &project);
+        proc.add(100, 1, "bash", 'S', &project);
+        proc.add(10, 100, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+
+        let ready = watcher.scan_at(None).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Fix the bug");
+    }
+
+    #[test]
+    fn does_not_notify_when_opencode_parent_is_not_terminal() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "weiran-tinker", 'S', &project);
+        proc.add(10, 6, "opencode", 'S', &project);
+
+        let db = TestDb::new();
+        db.session("root", None, project.to_str().unwrap(), "Fix the bug");
+        db.message("user", "root", 1, user_message());
+        db.message(
+            "assistant",
+            "root",
+            2,
+            &assistant_message("user", None, None),
+        );
+        let mut watcher =
+            Watcher::for_test_with_proc(db.path.clone(), proc.root.clone());
+
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+        db.update_message(
+            "assistant",
+            &assistant_message("user", Some("stop"), Some(3)),
+        );
+
+        assert!(watcher.scan_at(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notifies_when_opencode_is_launched_from_a_shell_wrapper() {
+        let proc = FakeProc::new();
+        let project = proc.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        proc.add(5, 1, "foot", 'S', &project);
+        proc.add(6, 5, "code", 'S', &project);
+        proc.set_exe(6, "/usr/bin/bash");
+        proc.add(10, 6, "opencode", 'S', &project);
 
         let db = TestDb::new();
         db.session("root", None, project.to_str().unwrap(), "Fix the bug");
